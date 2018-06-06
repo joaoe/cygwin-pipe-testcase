@@ -1,0 +1,157 @@
+#!/bin/bash
+
+function usage {
+	echo "Usage: $(basename "$0") {--gdb, force} [sources] -- [args to program]" >&2
+	exit 255
+}
+
+function array_add {
+	eval "$1[\${#$1[@]}]=\"\$2\""
+}
+
+function array_echo {
+	local elements="$1[@]"
+	for x in ${!elements}; do
+		echo "$x"
+	done
+}
+
+function run_echo {
+	echo "$@" >&2
+	"$@"
+}
+
+function check_age {
+	# @ [targets] -- [sources]
+	# return 0, target needs recreation
+	# return 1, target is updated
+	# return 128 >= errors
+
+	local dts="" ndts=
+	while [[ $# != 0 && "$1" != "--" ]]; do
+		local destfile="$1"
+		shift
+
+		if [[ ! -e "${destfile}" ]]; then
+			ndts=0
+
+		elif [[ ! -f "${destfile}" ]]; then
+			echo "target '${destfile}' must be a regular file" >&2
+			return 134
+
+		else
+			ndts="$(stat -L -c %Y "${destfile}")"
+		fi
+
+		[[ ! "$dts" || "$ndts" -lt "$dts" ]] && dts="$ndts"
+	done
+
+	if [[ ! "$dts" ]]; then
+		echo "no targets specified" >&2
+		return 133
+	fi
+
+	shift # throw "--"
+
+	local sourcefile= nsts= sts= has_sources=
+	for sourcefile in "$@"; do
+		if [[ ! -e "${sourcefile}" ]]; then
+			echo "missing source '${sourcefile}'" >&2
+			return 128
+
+		elif [[ ! -f "${sourcefile}" ]]; then
+			echo "source '${sourcefile}' must be a regular file" >&2
+			return 130
+
+		else
+			nsts="$(stat -L -c %Y "${sourcefile}")" || return 131
+			has_sources=1
+		fi
+		# Dest timestamp lower than source timestamp ? The update the destination.
+		# Don't break loop just yet, so to check that all sources are available.
+		[[ "$nsts" && "$dts" -lt "$nsts" ]] && sts="$nsts"
+	done
+
+	if [[ ! "$has_sources" ]]; then
+		echo "no sources specified" >&2
+		return 132
+
+	elif [[ "$sts" ]]; then
+		# sts now holds a time with a more recent source, then the destinations.
+		return 0
+
+	else
+		# Source are older
+		return 1
+	fi
+}
+
+
+function parse_arguments {
+	while [[ $# != 0 ]]; do
+	case "$1" in
+	-h|--help)
+		usage
+		;;
+	--force)
+		force=1
+		;;
+	--gdb)
+		gdb_prolog=( gdb -ex=run --args )
+		;;
+	--)
+		break;
+		;;
+	-*)
+		array_add compiler_args "$1"
+		;;
+	*)
+		array_add sources "$(readlink -m "$1")"
+		;;
+	esac
+	shift
+	done
+
+	program_args=( "$@" )
+
+	[[ ${#sources[@]} = 0 ]] && usage
+}
+
+function main {
+	# Uncomment to CD into script folder.
+	# cd "$(readlink -m "$BASH_SOURCE" | xargs dirname)"
+	local compiler_args=()
+	local sources=()
+	local program_args=()
+	local gdb_prolog=()
+	local force=
+
+	parse_arguments "$@"
+
+	local checksum="$(array_echo sources | sort | md5sum | awk '{print $1}')"
+
+	local executable="/tmp/${checksum}"
+
+	if [[ "$force" ]] || check_age "$executable" -- "${sources[@]}"; then
+		run_echo g++ -std=c++11 "${sources[@]}" -Werror -Wall -g -O0 -o "$executable"
+
+		local status=$?
+		if [[ $status != 0 ]]; then
+			rm -f "$executable"
+			exit $status
+		fi
+	fi
+
+	if [[ -x "$executable" ]]; then
+		echo "Have executable $executable" >&2
+
+		"${gdb_prolog[@]}" "$executable" "${program_args[@]}"
+
+		exit $?
+	fi
+
+	exit 0
+}
+
+main "$@"
+
